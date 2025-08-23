@@ -7,7 +7,14 @@ import (
 )
 
 func getConfigFile() (string, error) {
-	homeDir, err := os.UserHomeDir()
+	homeDir := os.Getenv("FREON_HOME")
+	var err error
+	if homeDir == "" {
+		homeDir, err = os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+	}
 	if err != nil {
 		return "", err
 	}
@@ -67,10 +74,11 @@ func (cfg FreonConfig) Save() error {
 	return encoder.Encode(cfg)
 }
 
-func (cfg FreonConfig) AddShare(host, groupID, publicKey, share string, otherShares map[string]string) error {
+func (cfg FreonConfig) AddShare(host, groupID string, partyID uint16, publicKey, share string, otherShares map[string]string) error {
 	s := Shares{
 		Host:           host,
 		GroupID:        groupID,
+		PartyID:        partyID,
 		PublicKey:      publicKey,
 		EncryptedShare: share,
 		PublicShares:   otherShares,

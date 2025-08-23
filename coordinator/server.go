@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -48,14 +49,13 @@ func main() {
 	sessionManager = scs.New()
 	sessionManager.Lifetime = 12 * time.Hour
 
-	mux := http.NewServeMux()
-
 	http.HandleFunc("/", indexPage)
 
 	http.HandleFunc("/keygen/create", createKeygen)
 	http.HandleFunc("/keygen/join", joinKeygen)
 	http.HandleFunc("/keygen/poll", pollKeygen)
 	http.HandleFunc("/keygen/send", sendKeygen)
+	http.HandleFunc("/keygen/get-messages", getKeygenMessages)
 	http.HandleFunc("/keygen/finalize", finalizeKeygen)
 
 	http.HandleFunc("/sign/create", createSign)
@@ -63,10 +63,12 @@ func main() {
 	http.HandleFunc("/sign/join", joinSign)
 	http.HandleFunc("/sign/poll", pollSign)
 	http.HandleFunc("/sign/send", sendSign)
+	http.HandleFunc("/sign/get-messages", getSignMessages)
 	http.HandleFunc("/sign/finalize", finalizeSign)
+	http.HandleFunc("/sign/get", getSign)
 
 	http.HandleFunc("/terminate", terminateSign)
-	http.ListenAndServe(serverConfig.Hostname, sessionManager.LoadAndSave(mux))
+	http.ListenAndServe(serverConfig.Hostname, sessionManager.LoadAndSave(http.DefaultServeMux))
 }
 
 // Handler for error pages
@@ -92,6 +94,10 @@ func createKeygen(w http.ResponseWriter, r *http.Request) {
 	err := json.NewDecoder(r.Body).Decode(&req)
 	if err != nil {
 		sendError(w, err)
+		return
+	}
+	if req.Threshold > req.Participants {
+		sendError(w, errors.New("threshold cannot exceeed party size"))
 		return
 	}
 	uid, err := internal.NewKeyGroup(db, req.Participants, req.Threshold)
@@ -173,6 +179,38 @@ func pollKeygen(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
+// Get messages for a keygen ceremony
+func getKeygenMessages(w http.ResponseWriter, r *http.Request) {
+	var req KeyGenMessageRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		sendError(w, err)
+		return
+	}
+	inbox, err := internal.GetKeygenMessagesSince(db, req.GroupID, req.LastSeen)
+	if err != nil {
+		sendError(w, err)
+		return
+	}
+	// Get a new maximum
+	var latestID = req.LastSeen
+	var messages []string
+	for _, m := range inbox {
+		messages = append(messages, hex.EncodeToString(m.Message))
+		if m.DbId > latestID {
+			latestID = m.DbId
+		}
+	}
+
+	// Let's queue up the messages
+	response := KeyGenMessageResponse{
+		LatestMessageID: latestID,
+		Messages:        messages,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(&response)
+}
+
 // Send a message to participate in a keygen ceremony
 func sendKeygen(w http.ResponseWriter, r *http.Request) {
 	var req KeyGenMessageRequest
@@ -186,39 +224,38 @@ func sendKeygen(w http.ResponseWriter, r *http.Request) {
 		sendError(w, err)
 		return
 	}
+
+	// First, add the new message to the database.
+	_, err = internal.AddKeyGenMessage(db, req.GroupID, req.MyPartyID, msg)
+	if err != nil {
+		sendError(w, err)
+		return
+	}
+
+	// Now, get all messages since the client's last seen ID.
+	// This will include the message we just added, and any from other clients.
 	inbox, err := internal.GetKeygenMessagesSince(db, req.GroupID, req.LastSeen)
 	if err != nil {
 		sendError(w, err)
 		return
 	}
-	// Get a new maximum
-	var max = req.LastSeen
+
+	// Build the response
+	var latestID = req.LastSeen
 	var messages []string
 	for _, m := range inbox {
-		if m.DbId >= max {
-			max = m.DbId
-		}
 		messages = append(messages, hex.EncodeToString(m.Message))
+		if m.DbId > latestID {
+			latestID = m.DbId
+		}
 	}
 
-	record, err := internal.AddKeyGenMessage(db, req.GroupID, req.MyPartyID, msg)
-	if err != nil {
-		sendError(w, err)
-		return
-	}
-
-	// If no other inserts occured, we can do this
-	if record.DbId-max == 1 {
-		max = record.DbId
-	}
-
-	// Let's queue up the messages
 	response := KeyGenMessageResponse{
-		LatestMessageID: max,
+		LatestMessageID: latestID,
 		Messages:        messages,
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	json.NewEncoder(w).Encode(&response)
 }
 
 // Create a signing ceremony
@@ -271,26 +308,25 @@ func pollSign(w http.ResponseWriter, r *http.Request) {
 		sendError(w, err)
 		return
 	}
-	response, err := internal.PollSignCeremony(db, req.CeremonyID, *req.PartyID)
+	var partyID uint16 = 0
+	if req.PartyID != nil {
+		partyID = *req.PartyID
+	}
+	response, err := internal.PollSignCeremony(db, req.CeremonyID, partyID)
 	if err != nil {
 		sendError(w, err)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	json.NewEncoder(w).Encode(&response)
 
 }
 
-// Send a message to a signing ceremony
-func sendSign(w http.ResponseWriter, r *http.Request) {
+// Get messages for a signing ceremony
+func getSignMessages(w http.ResponseWriter, r *http.Request) {
 	var req SignMessageRequest
 	err := json.NewDecoder(r.Body).Decode(&req)
-	if err != nil {
-		sendError(w, err)
-		return
-	}
-	msg, err := hex.DecodeString(req.Message)
 	if err != nil {
 		sendError(w, err)
 		return
@@ -310,24 +346,59 @@ func sendSign(w http.ResponseWriter, r *http.Request) {
 		messages = append(messages, hex.EncodeToString(m.Message))
 	}
 
-	record, err := internal.AddSignMessage(db, req.CeremonyID, req.MyPartyID, msg)
-	if err != nil {
-		sendError(w, err)
-		return
-	}
-
-	// If no other inserts occured, we can do this
-	if record.DbId-max == 1 {
-		max = record.DbId
-	}
-
 	// Let's queue up the messages
-	response := KeyGenMessageResponse{
+	response := SignMessageResponse{
 		LatestMessageID: max,
 		Messages:        messages,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
+}
+
+// Send a message to a signing ceremony
+func sendSign(w http.ResponseWriter, r *http.Request) {
+	var req SignMessageRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		sendError(w, err)
+		return
+	}
+	msg, err := hex.DecodeString(req.Message)
+	if err != nil {
+		sendError(w, err)
+		return
+	}
+
+	// First, add the new message to the database.
+	_, err = internal.AddSignMessage(db, req.CeremonyID, req.MyPartyID, msg)
+	if err != nil {
+		sendError(w, err)
+		return
+	}
+
+	// Now, get all messages since the client's last seen ID.
+	inbox, err := internal.GetSignMessagesSince(db, req.CeremonyID, req.LastSeen)
+	if err != nil {
+		sendError(w, err)
+		return
+	}
+
+	// Build the response
+	var latestID = req.LastSeen
+	var messages []string
+	for _, m := range inbox {
+		messages = append(messages, hex.EncodeToString(m.Message))
+		if m.DbId > latestID {
+			latestID = m.DbId
+		}
+	}
+
+	response := SignMessageResponse{
+		LatestMessageID: latestID,
+		Messages:        messages,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(&response)
 }
 
 // Store the final public key for the group
@@ -413,6 +484,43 @@ func listSign(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
+func getSign(w http.ResponseWriter, r *http.Request) {
+	var req GetSignRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		sendError(w, err)
+		return
+	}
+	signature, err := internal.GetSignature(db, req.CeremonyID)
+	if err != nil {
+		sendError(w, err)
+		return
+	}
+
+	response := GetSignResponse{
+		Signature: signature,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
 func terminateSign(w http.ResponseWriter, r *http.Request) {
-	// TODO - soatok
+	var req TerminateRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		sendError(w, err)
+		return
+	}
+
+	err = internal.TerminateCeremony(db, req.CeremonyID)
+	if err != nil {
+		sendError(w, err)
+		return
+	}
+
+	response := VapidResponse{
+		Status: "OK",
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
